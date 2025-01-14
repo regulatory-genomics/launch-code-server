@@ -1,0 +1,26 @@
+[tool.poetry]
+name = "launch-code-server"
+version = "0.1.0"
+description = ""
+authors = ["Kai Zhang <zhangkai33@westlake.edu.cn>"]
+readme = "README.md"
+packages = [
+    { include = "launch_code_server", from = "src" },
+]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+fabric = "^3.2.2"
+sshconf = "^0.2.5"
+pyslurm = { git = "https://github.com/PySlurm/pyslurm.git", tag = "v22.5.3", optional = true }
+
+[tool.poetry.extras]
+server = ["pyslurm"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+launch_server = "launch_code_server.client:main"
+vscode_server = "launch_code_server.server:main"
