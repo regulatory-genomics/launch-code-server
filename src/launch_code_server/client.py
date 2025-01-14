@@ -8,37 +8,23 @@ import sys
 import time
 import logging
 
-def exec(conn, code, conda_cmd_path=None, conda_env_name=None, conda_env_path=None):
-    if conda_cmd_path is not None:
-        if conda_env_name is not None:
-            cmd = f"{conda_cmd_path} run -n {conda_env_name} "
-        elif conda_env_path is not None:
-            cmd = f"{conda_cmd_path} run -p {conda_env_path} "
-        else:
-            cmd = ""
-    else:
-        cmd = ""
-
+def exec(conn, code):
     tmp = sys.stdout
     output = StringIO()
     sys.stdout = output
-    conn.run(
-        cmd + code,
-        out_stream=sys.stdout,
-        hide='err',
-    )
+    conn.run(code, out_stream=sys.stdout, hide='err')
     sys.stdout = tmp
     return output.getvalue()
 
-def launch_compute(conn, partition, n_cpus, memory_per_cpu, timeout, node, **kwargs):
+def launch_compute(conn, partition, n_cpus, memory_per_cpu, node, timeout=300):
     partition = '' if partition is None else f'--partition {partition}'
     compute_node = '' if node is None else f'--compute_node {node}'
-    output = exec(conn, f"vscode_server launch {partition} --number_of_cpus {n_cpus} --timeout {timeout} --memory_per_cpu {memory_per_cpu} {compute_node}", **kwargs)
+    output = exec(conn, f"vscode_server launch {partition} --number_of_cpus {n_cpus} --timeout {timeout} --memory_per_cpu {memory_per_cpu} {compute_node}")
     job_id, node, port = output.strip().split('\t')
     return (int(job_id), node, int(port))
 
-def check_compute(conn, host, port, **kwargs):
-    return exec(conn, f"vscode_server check --host {host} --port {port}", **kwargs).strip()
+def check_compute(conn, host, port):
+    return exec(conn, f"vscode_server check --host {host} --port {port}").strip()
 
 def connect_server(host, user, port=None):
     conn = Connection(host, user=user, port=port)
@@ -89,17 +75,13 @@ def main():
 
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Reserve vscode remote server")
-    parser.add_argument('destination', type=str, help="login details of HPC headnode")
-    parser.add_argument('-p', "--port", type=int, help="port") 
-    parser.add_argument('-f', "--forward-port", type=int, default=2222, help="local port to forward to remote port") 
+    parser.add_argument('destination', type=str, help="Address of the HPC headnode")
+    parser.add_argument('-p', "--port", type=int, help="Port to connect to") 
+    parser.add_argument('-f', "--forward-port", type=int, default=2222, help="Local port to forward to remote port") 
     parser.add_argument("--partition", type=str, help="Partition to submit the job to.")
     parser.add_argument("--compute-node", type=str, help="Hostname of compute node to reserve.")
     parser.add_argument("-n", "--num-cpus", type=int, default=1, help="Number of CPUs requested for the job.")
     parser.add_argument("-m", "--memory_per_cpu", type=str, default="8G", help="Memory per cpu requested for the job.")
-    parser.add_argument("--timeout", type=int, default=300, help="Server timeout.")
-    parser.add_argument("--conda-cmd-path", type=str, default="micromamba", help="Path to conda executable.")
-    parser.add_argument("--conda-env-name", type=str)
-    parser.add_argument("--conda-env-path", type=str)
     args = parser.parse_args()
 
     destination = args.destination.split('@')
@@ -114,10 +96,7 @@ def main():
     conn = connect_server(host, user, args.port)
 
     logging.info("Trying to reserve a remote compute node...")
-    job_id, node, port = launch_compute(
-        conn, args.partition, args.num_cpus, args.memory_per_cpu, args.timeout, args.compute_node,
-        conda_cmd_path=args.conda_cmd_path, conda_env_name=args.conda_env_name, conda_env_path=args.conda_env_path,
-    )
+    job_id, node, port = launch_compute(conn, args.partition, args.num_cpus, args.memory_per_cpu, args.compute_node)
     logging.info(f"A job (id={job_id}) has been reserved on node {node}")
     with conn.forward_local(args.forward_port, 22, remote_host=node):
         logging.info(f"Setup port forwarding: localhost:{args.forward_port} => {node}:22")
@@ -127,10 +106,7 @@ def main():
         time.sleep(30)
         while True:
             try:
-                response = check_compute(
-                    conn, node, port,
-                    conda_cmd_path=args.conda_cmd_path, conda_env_name=args.conda_env_name, conda_env_path=args.conda_env_path,
-                )
+                response = check_compute(conn, node, port)
                 if not response.startswith('SUCCESS'):
                     logging.error(f"An error occurred during the communication with the remote server: {response}")
                     sys.exit(1)
