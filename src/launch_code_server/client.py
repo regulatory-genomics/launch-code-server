@@ -89,7 +89,7 @@ def main():
 
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Reserve vscode remote server")
-    parser.add_argument('destination', type=str, required=True, help="login details of HPC headnode")
+    parser.add_argument('destination', type=str, help="login details of HPC headnode")
     parser.add_argument('-p', "--port", type=int, help="port") 
     parser.add_argument('-f', "--forward-port", type=int, default=2222, help="local port to forward to remote port") 
     parser.add_argument("--partition", type=str, help="Partition to submit the job to.")
