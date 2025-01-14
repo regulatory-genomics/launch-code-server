@@ -103,6 +103,7 @@ def main():
         update_ssh_config(user, args.forward_port)
 
         logging.info("Press Ctrl+D to quit and shutdown the node...")
+        patience = 3
         time.sleep(30)
         while True:
             try:
@@ -110,7 +111,12 @@ def main():
                 if not response.startswith('SUCCESS'):
                     logging.error(f"An error occurred during the communication with the remote server: {response}")
                     sys.exit(1)
-                time.sleep(15)
-            except:
-                logging.error("Fail to connect to the server. Now stop.")
-                sys.exit(1)
+                else:
+                    patience = 3
+            except Exception as err:
+                if patience <= 0:
+                    logging.error(f"Fail to connect to the server: Unexpected {err=}, {type(err)=}")
+                    sys.exit(1)
+                else:
+                    patience -= 1
+            time.sleep(15)
