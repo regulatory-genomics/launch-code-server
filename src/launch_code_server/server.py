@@ -1,6 +1,8 @@
 import argparse
-import pyslurm
 import time
+import tempfile
+import os
+import subprocess
 
 def main():
     main_parser = argparse.ArgumentParser(description="Reserve vscode-server.")
@@ -28,27 +30,95 @@ def launch_server(args):
     import random
 
     random_port = random.randint(49152, 65535)
-    job_desc = pyslurm.JobSubmitDescription(
-        name="vscode-server",
-        script=server_script(random_port, args.timeout),
-        partitions=args.partition,
-        time_limit='8:00:00',
-        ntasks=args.number_of_cpus,
-        memory_per_cpu=args.memory_per_cpu,
-        standard_error="vscode_slurm.log",
-        standard_output="vscode_slurm.log",
-        required_nodes=args.compute_node,
-    )
+    script_content = server_script(random_port, args.timeout)
 
-    job_id = job_desc.submit()
+    # Write the server script to a temporary file
+    script_fd, script_path = tempfile.mkstemp(suffix='.sh', text=True)
+    try:
+        os.write(script_fd, script_content.encode())
+        os.close(script_fd)
+        os.chmod(script_path, 0o755)
 
-    job = pyslurm.Job(job_id).load(job_id)
-    while job.state != 'RUNNING':
-        time.sleep(1)
-        job = job.load(job_id)
+        # Build the sbatch command
+        sbatch_cmd = [
+            "sbatch",
+            "--job-name=vscode-server",
+            "--time=8:00:00",
+            f"--error=vscode_slurm.log",
+            f"--output=vscode_slurm.log"
+        ]
 
-    print(f"{job_id}\t{job.allocated_nodes}\t{random_port}")
+        if args.partition:
+            sbatch_cmd.append(f"--partition={args.partition}")
+        if args.number_of_cpus:
+            sbatch_cmd.append(f"--ntasks={args.number_of_cpus}")
+        if args.memory_per_cpu:
+            sbatch_cmd.append(f"--mem-per-cpu={args.memory_per_cpu}")
+        if args.compute_node:
+            sbatch_cmd.append(f"--nodelist={args.compute_node}")
 
+        sbatch_cmd.append(script_path)
+
+        # Submit the job
+        result = subprocess.run(
+            sbatch_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+
+        # Parse job ID from sbatch output
+        job_id = None
+        for word in result.stdout.split():
+            if word.isdigit():
+                job_id = word
+                break
+        if not job_id:
+            raise RuntimeError("Could not parse job ID from sbatch output")
+
+        # Wait for the job to enter RUNNING state
+        while True:
+            squeue_cmd = [
+                "squeue",
+                "-j", job_id,
+                "--format=%T",
+                "--noheader"
+            ]
+            result = subprocess.run(
+                squeue_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True
+            )
+            state = result.stdout.strip()
+            if state == "RUNNING":
+                break
+            time.sleep(1)
+
+        # Get the allocated nodes
+        squeue_cmd = [
+            "squeue",
+            "-j", job_id,
+            "--format=%N",
+            "--noheader"
+        ]
+        result = subprocess.run(
+            squeue_cmd,
+            stdout=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+        allocated_nodes = result.stdout.strip()
+
+        # Output the job ID, allocated nodes, and port
+        print(f"{job_id}\t{allocated_nodes}\t{random_port}")
+
+    finally:
+        # Clean up the temporary script file
+        if os.path.exists(script_path):
+            os.remove(script_path)
 
 def check_server(args):
     import socket
