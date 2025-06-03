@@ -3,7 +3,7 @@
 ## Install server-side application (on the HPC)
 
 ```shell
-pip install 'git+https://github.com/regulatory-genomics/launch-code-server.git#egg=launch-code-server'[server]
+pip install 'git+https://github.com/regulatory-genomics/launch-code-server.git#egg=launch-code-server'
 ```
 
 ## Install client-side application (on your computer)
