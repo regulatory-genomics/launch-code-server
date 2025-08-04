@@ -9,7 +9,7 @@ pip install 'git+https://github.com/regulatory-genomics/launch-code-server.git#e
 ## Install client-side application (on your computer)
 
 ```shell
-pip install 'git+https://github.com/regulatory-genomics/launch-code-server.git#egg=launch-code-server'
+pip install 'git+https://github.com/regulatory-genomics/launch-code-server.git#egg=launch-code-server'[client]
 ```
 
 # Usage
