@@ -128,7 +128,7 @@ def check_server(args):
         client_socket.connect((args.host, args.port))
         message = client_socket.recv(1024)
         client_socket.close()
-        print(f"SUCCESS: {message.decode()}")
+        print(f"SUCCESS: {message.decode('utf-8')}")
     except socket.error as err:
         print(f"ERROR: {err}")
 
@@ -143,6 +143,7 @@ def check_server(args):
 
 def server_script(port, timeout=150):
     return f"""#!/usr/bin/env python
+from __future__ import print_function
 import socket
 import select
 
@@ -151,18 +152,17 @@ def start_server():
     server_socket.bind(("0.0.0.0", {port}))
     server_socket.listen(5)
     server_socket.setblocking(0)  # Set socket to non-blocking mode
-    print(f"Server listening on port {port}")
+    print("Server listening on port {port}")
 
     try:
         while True:
-            # Use select to wait for incoming connections with a timeout
             readable, _, _ = select.select([server_socket], [], [], {timeout})
             if readable:
                 client_socket, addr = server_socket.accept()
-                client_socket.send(b'Hello, thanks for connecting')
+                client_socket.send('Hello, thanks for connecting'.encode('utf-8'))
                 client_socket.close()
             else:
-                print(f"No clients connected for {timeout} seconds. Shutting down server.")
+                print("No clients connected for {timeout} seconds. Shutting down server.")
                 break
     finally:
         server_socket.close()

@@ -8,14 +8,6 @@ import sys
 import time
 import logging
 
-def exec(conn, code):
-    tmp = sys.stdout
-    output = StringIO()
-    sys.stdout = output
-    conn.run(code, out_stream=sys.stdout, hide='err')
-    sys.stdout = tmp
-    return output.getvalue()
-
 def launch_compute(conn, partition, n_cpus, memory_per_cpu, node, timeout=300):
     partition = '' if partition is None else f'--partition {partition}'
     compute_node = '' if node is None else f'--compute_node {node}'
@@ -27,6 +19,8 @@ def check_compute(conn, host, port):
     return exec(conn, f"vscode_server check --host {host} --port {port}").strip()
 
 def connect_server(host, user, port=None):
+    """ Establish a ssh connect between local and remote head node
+    """
     conn = Connection(host, user=user, port=port)
 
     try:
@@ -38,7 +32,19 @@ def connect_server(host, user, port=None):
 
     return conn
 
+def exec(conn, code):
+    """ Convenient wrapper to execute arbitrary python code on a remote
+    """
+    tmp = sys.stdout
+    output = StringIO()
+    sys.stdout = output
+    conn.run(code, out_stream=sys.stdout, hide='err')
+    sys.stdout = tmp
+    return output.getvalue()
+
 def get_user(hostname):
+    """ Get login information from ssh configuration file
+    """
     c = read_ssh_config(expanduser("~/.ssh/config"))
     if hostname in c.hosts():
         return c.host(hostname)['user']
@@ -46,6 +52,8 @@ def get_user(hostname):
         raise ValueError(f"Host {hostname} is not in your ssh configuration file")
 
 def update_ssh_config(user, port):
+    """ Update login information for the code server
+    """
     host = 'vscode-server'
     path = expanduser("~/.ssh/config")
     c = read_ssh_config(path)
