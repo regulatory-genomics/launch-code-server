@@ -49,7 +49,7 @@ EOF
         """
     ).strip()
 
-    conn.run(command, hide=True)
+    conn.run(command, hide=False)
 
 def ensure_proxy_tunnel(conn, node, login_host, target_host, target_port, local_port):
     """Start (if needed) the SSH tunnel that exposes the cluster HTTP proxy."""
