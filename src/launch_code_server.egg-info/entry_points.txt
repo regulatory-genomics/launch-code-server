@@ -1,0 +1,3 @@
+[console_scripts]
+launch_server = launch_code_server.client:main
+vscode_server = launch_code_server.server:main

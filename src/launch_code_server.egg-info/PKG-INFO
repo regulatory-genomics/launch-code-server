@@ -1,0 +1,31 @@
+Metadata-Version: 2.4
+Name: launch-code-server
+Version: 0.2.0
+Summary: Launching vscode server with ease
+Author-email: Kai Zhang <zhangkai33@westlake.edu.cn>
+Requires-Python: >=3.6
+Description-Content-Type: text/markdown
+Provides-Extra: client
+Requires-Dist: fabric>=3.2.2; extra == "client"
+Requires-Dist: sshconf>=0.2.5; extra == "client"
+
+# Installation
+
+## Install server-side application (on the HPC)
+
+```shell
+pip install 'git+https://github.com/regulatory-genomics/launch-code-server.git#egg=launch-code-server'
+```
+
+## Install client-side application (on your computer)
+
+```shell
+pip install 'git+https://github.com/regulatory-genomics/launch-code-server.git#egg=launch-code-server'[client]
+```
+
+# Usage
+
+1. Copy your ssh public key to the HPC server if you have not done so.
+   You still need to do this even if you cannot use the public key to login to the HPC server.
+3. Open a terminal on your computer and type `launch_server USERNAME@HOSTNAME`.
+4. Open vscode, and from the list of remote servers choose `vscode-server` to connect.

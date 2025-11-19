@@ -1,0 +1,4 @@
+
+[client]
+fabric>=3.2.2
+sshconf>=0.2.5
