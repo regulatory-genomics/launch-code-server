@@ -53,23 +53,54 @@ EOF
 
 def ensure_proxy_tunnel(conn, node, login_host, target_host, target_port, local_port):
     """Start (if needed) the SSH tunnel that exposes the cluster HTTP proxy."""
-    remote_script = textwrap.dedent(
-        f"""
-        set -e
-        pattern="ssh -N -f -L {local_port}:{target_host}:{target_port} {login_host}"
-        if pgrep -f "$pattern" >/dev/null 2>&1; then
-            exit 0
-        fi
-        nohup ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -N -f -L {local_port}:{target_host}:{target_port} {login_host} >/tmp/launch_code_server_proxy.log 2>&1
-        """
-    ).strip()
+    # First check if tunnel is already running - look for actual LISTEN socket
+    check_cmd = f"ss -tln | grep ':{local_port} '"
+    result = conn.run(f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {node} '{check_cmd}'", hide=True, warn=True)
+    
+    # Check if we got actual output showing a listening socket
+    if result.stdout.strip() and "LISTEN" in result.stdout:
+        logging.info(f"Proxy tunnel already running on port {local_port}")
+        return
 
-    quoted = shlex.quote(remote_script)
-    command = (
-        f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {node} "
-        f"'bash -lc {quoted}'"
-    )
-    conn.run(command, hide=True)
+    # Prompt for OTP locally
+    otp = getpass.getpass(f"Enter OATH OTP for tunnel on {node}: ")
+    
+    logging.info("Starting proxy tunnel with provided OTP...")
+
+    # Use SSH_ASKPASS with a helper script to handle OTP prompt non-interactively
+    askpass_script = textwrap.dedent(f"""
+        #!/bin/bash
+        echo "{otp}"
+    """).strip()
+
+    setup_cmds = f"""
+cat <<'EOF' > ~/.ssh_askpass_tunnel
+{askpass_script}
+EOF
+chmod +x ~/.ssh_askpass_tunnel
+export SSH_ASKPASS=~/.ssh_askpass_tunnel
+export DISPLAY=:0  # SSH_ASKPASS needs DISPLAY set (even dummy) or setsid
+setsid ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=keyboard-interactive,password -N -f -L {local_port}:{target_host}:{target_port} {login_host} < /dev/null
+rm ~/.ssh_askpass_tunnel
+    """
+
+    full_cmd = f"ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {node} {shlex.quote(setup_cmds)}"
+    
+    conn.run(full_cmd, pty=True, warn=True)
+    
+    # Wait for tunnel to bind
+    logging.info("Waiting for tunnel to establish...")
+    time.sleep(3)
+    
+    # Verify tunnel is running
+    verify_cmd = f"ss -tln | grep ':{local_port} '"
+    result = conn.run(f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {node} '{verify_cmd}'", hide=True, warn=True)
+    
+    if result.stdout.strip() and "LISTEN" in result.stdout:
+        logging.info(f"Proxy tunnel successfully established on {node}:{local_port}")
+    else:
+        logging.warning(f"Could not verify proxy tunnel on {node}:{local_port}")
+        logging.warning(f"Manual check: ssh {node} 'ss -tln | grep {local_port}'")
 
 def connect_server(host, user, port=None):
     """ Establish a ssh connect between local and remote head node
@@ -180,7 +211,7 @@ def main():
     logging.info(f"A job (id={job_id}) has been reserved on node {node}")
 
     if args.setup_proxy:
-        logging.info("Attempting to start proxy tunnel on compute node...")
+        logging.info("Setting up proxy tunnel on compute node...")
         try:
             ensure_proxy_tunnel(
                 conn,
@@ -190,16 +221,16 @@ def main():
                 args.proxy_target_port,
                 args.proxy_local_port,
             )
-            logging.info("Proxy tunnel configured on compute node.")
         except Exception as err:
-            logging.warning("Failed to configure proxy tunnel automatically: %s", err)
+            logging.warning(f"Failed to configure proxy tunnel: {err}")
+            logging.info(f"You can manually run on {node}: ssh -N -L {args.proxy_local_port}:{args.proxy_target_host}:{args.proxy_target_port} {args.proxy_login_host}")
     with conn.forward_local(args.forward_port, 22, remote_host=node):
         logging.info(f"Setup port forwarding: localhost:{args.forward_port} => {node}:22")
         update_ssh_config(user, args.forward_port)
 
         logging.info("Press Ctrl+D to quit and shutdown the node...")
         patience = 3
-        time.sleep(30)
+        time.sleep(15)
         while True:
             try:
                 response = check_compute(conn, node, port, env_name=args.env_name)
