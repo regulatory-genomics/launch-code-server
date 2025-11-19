@@ -11,8 +11,6 @@ from os.path import expanduser
 from fabric import Connection
 from sshconf import read_ssh_config
 
-SSH_BASE_OPTS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-
 def launch_compute(conn, partition, n_cpus, memory_per_cpu, node, timeout=300, env_name=None):
     partition = '' if partition is None else f'--partition {partition}'
     compute_node = '' if node is None else f'--compute_node {node}'
@@ -53,52 +51,52 @@ EOF
 
     conn.run(command, hide=True)
 
-def run_on_node(conn, node, command, **kwargs):
-    """Execute a command on a compute node via the head-node connection."""
-    ssh_cmd = f"ssh {SSH_BASE_OPTS} {node} {shlex.quote(command)}"
-    return conn.run(ssh_cmd, **kwargs)
-
-def tunnel_is_listening(conn, node, local_port):
-    check_cmd = f"ss -H -tln | grep -q ':{local_port} ' && echo RUNNING || echo STOPPED"
-    result = run_on_node(conn, node, check_cmd, hide=True, warn=True)
-    return "RUNNING" in result.stdout
-
 def ensure_proxy_tunnel(conn, node, login_host, target_host, target_port, local_port):
     """Start (if needed) the SSH tunnel that exposes the cluster HTTP proxy."""
-    if tunnel_is_listening(conn, node, local_port):
+    # First check if tunnel is already running - look for actual LISTEN socket
+    check_cmd = f"ss -tln | grep ':{local_port} '"
+    result = conn.run(f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {node} '{check_cmd}'", hide=True, warn=True)
+    
+    # Check if we got actual output showing a listening socket
+    if result.stdout.strip() and "LISTEN" in result.stdout:
         logging.info(f"Proxy tunnel already running on port {local_port}")
         return
 
+    # Prompt for OTP locally
     otp = getpass.getpass(f"Enter OATH OTP for tunnel on {node}: ")
+    
     logging.info("Starting proxy tunnel with provided OTP...")
 
-    askpass_script = textwrap.dedent(
-        f"""
+    # Use SSH_ASKPASS with a helper script to handle OTP prompt non-interactively
+    askpass_script = textwrap.dedent(f"""
         #!/bin/bash
         echo "{otp}"
-        """
-    ).strip()
+    """).strip()
 
-    remote_setup = textwrap.dedent(
-        f"""
-        cat <<'EOF' > ~/.ssh_askpass_tunnel
+    setup_cmds = f"""
+cat <<'EOF' > ~/.ssh_askpass_tunnel
 {askpass_script}
 EOF
-        chmod 700 ~/.ssh_askpass_tunnel
-        export SSH_ASKPASS=~/.ssh_askpass_tunnel
-        export DISPLAY=:0
-        setsid ssh {SSH_BASE_OPTS} -o PubkeyAuthentication=no -o PreferredAuthentications=keyboard-interactive,password \\
-            -N -f -L {local_port}:{target_host}:{target_port} {login_host} < /dev/null
-        rm ~/.ssh_askpass_tunnel
-        """
-    ).strip()
+chmod +x ~/.ssh_askpass_tunnel
+export SSH_ASKPASS=~/.ssh_askpass_tunnel
+export DISPLAY=:0  # SSH_ASKPASS needs DISPLAY set (even dummy) or setsid
+setsid ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=keyboard-interactive,password -N -f -L {local_port}:{target_host}:{target_port} {login_host} < /dev/null
+rm ~/.ssh_askpass_tunnel
+    """
 
-    run_on_node(conn, node, remote_setup, pty=True, warn=True)
-
+    full_cmd = f"ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {node} {shlex.quote(setup_cmds)}"
+    
+    conn.run(full_cmd, pty=True, warn=True)
+    
+    # Wait for tunnel to bind
     logging.info("Waiting for tunnel to establish...")
     time.sleep(3)
-
-    if tunnel_is_listening(conn, node, local_port):
+    
+    # Verify tunnel is running
+    verify_cmd = f"ss -tln | grep ':{local_port} '"
+    result = conn.run(f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {node} '{verify_cmd}'", hide=True, warn=True)
+    
+    if result.stdout.strip() and "LISTEN" in result.stdout:
         logging.info(f"Proxy tunnel successfully established on {node}:{local_port}")
     else:
         logging.warning(f"Could not verify proxy tunnel on {node}:{local_port}")
