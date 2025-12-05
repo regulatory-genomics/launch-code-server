@@ -102,10 +102,10 @@ rm ~/.ssh_askpass_tunnel
         logging.warning(f"Could not verify proxy tunnel on {node}:{local_port}")
         logging.warning(f"Manual check: ssh {node} 'ss -tln | grep {local_port}'")
 
-def connect_server(host, user, port=None):
+def connect_server(host, user, port=None, gateway=None):
     """ Establish a ssh connect between local and remote head node
     """
-    conn = Connection(host, user=user, port=port)
+    conn = Connection(host, user=user, port=port, gateway=gateway)
 
     try:
         conn.open()
@@ -189,6 +189,9 @@ def main():
     parser.add_argument("--proxy-target-host", type=str, default="172.16.75.119", help="Internal HTTP proxy host.")
     parser.add_argument("--proxy-target-port", type=int, default=3128, help="Internal HTTP proxy port.")
     parser.add_argument("--proxy-local-port", type=int, default=9999, help="Local port on compute nodes that exposes the HTTP proxy.")
+    parser.add_argument("--jump-host", type=str, help="Jump server address")
+    parser.add_argument("--jump-port", type=int, default=22, help="Jump server port")
+    parser.add_argument("--jump-user", type=str, help="User for jump server (defaults to target user if not specified)")
     args = parser.parse_args()
 
     destination = args.destination.split('@')
@@ -200,7 +203,32 @@ def main():
     else:
         raise ValueError("Invalid destination format. Please provide the hostname or username@hostname.")
 
-    conn = connect_server(host, user, args.port)
+    # Handle jump server connection
+    gateway_conn = None
+    if args.jump_host:
+        logging.info(f"Connecting to jump server: {args.jump_host}:{args.jump_port}...")
+        
+        # Determine jump user (default to same as target user)
+        j_user = args.jump_user if args.jump_user else user
+        
+        # Create the connection object for the jump server
+        gateway_conn = Connection(args.jump_host, user=j_user, port=args.jump_port)
+        
+        # Authenticate to the Jump Server
+        try:
+            gateway_conn.open()
+        except Exception:
+            # Prompt for Jump Server password
+            j_pass = getpass.getpass(f"({j_user}@{args.jump_host}) Jump Server Password: ")
+            gateway_conn.connect_kwargs = {'password': j_pass}
+            gateway_conn.open()
+            
+        logging.info("Jump server connection established.")
+
+    # Connect to the actual HPC head node, passing the jump connection as the gateway
+    if gateway_conn:
+        logging.info(f"Connecting to target: {host} via gateway...")
+    conn = connect_server(host, user, args.port, gateway=gateway_conn)
 
     if args.setup_proxy:
         logging.info("Ensuring proxy environment variables are configured...")
