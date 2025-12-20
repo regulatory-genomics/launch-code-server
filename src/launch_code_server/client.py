@@ -22,19 +22,35 @@ def check_compute(conn, host, port, env_name=None):
     return exec(conn, f"vscode_server check --host {host} --port {port}", env_name=env_name).strip()
 
 def ensure_proxy_env_config(conn, local_port):
-    """Ensure the user's .bashrc exports proxy variables on compute nodes."""
+    """Ensure the user's .bashrc exports proxy variables using SFTP."""
 
-    # 1. Define the marker we look for
     marker = "# >>> launch_code_server proxy >>>"
 
-    # 2. Check if the configuration already exists
-    check_cmd = f"grep -Fq '{marker}' ~/.bashrc"
-    result = conn.run(check_cmd, warn=True, hide=True)
+    # Open an SFTP session (bypasses shell startup scripts)
+    sftp = conn.sftp()
 
-    # 3. If grep failed (exit code != 0), append the config
-    if result.failed:
-        logging.info("Appending proxy config to .bashrc...")
+    try:
+        # Read the remote .bashrc file
+        # We assume the file is in the home directory
+        remote_path = ".bashrc"
 
+        try:
+            # Open the remote file for reading
+            with sftp.open(remote_path, 'r') as f:
+                content = f.read().decode('utf-8')
+        except FileNotFoundError:
+            # If .bashrc doesn't exist, start with empty content
+            content = ""
+            logging.warning(f"{remote_path} not found, creating new one.")
+
+        # Check if the marker is already present
+        if marker in content:
+            logging.info("Proxy config already present in .bashrc.")
+            return
+
+        logging.info("Appending proxy config to .bashrc via SFTP...")
+
+        # Construct the block to append
         lines_to_add = [
             f"\n{marker}",
             f"if [[ \"$(hostname)\" != *\"login\"* ]]; then",
@@ -46,17 +62,17 @@ def ensure_proxy_env_config(conn, local_port):
             f"fi",
             f"# <<< launch_code_server proxy <<<\n"
         ]
-
-        # Join lines
         block = "\n".join(lines_to_add)
 
-        # Escape BOTH single quotes and double quotes for bash -c 'echo "..." ...'
-        block_escaped = block.replace("'", "'\\''").replace('"', '\\"')
+        # Append to the file (open in 'a' append mode)
+        with sftp.open(remote_path, 'a') as f:
+            f.write(block)
 
-        # Run command
-        conn.run(f"bash -c 'echo \"{block_escaped}\" >> ~/.bashrc'", hide=False)
-    else:
-        logging.info("Proxy config already present in .bashrc.")
+    except Exception as e:
+        logging.error(f"Failed to update .bashrc via SFTP: {e}")
+        raise e
+    finally:
+        sftp.close()
 
 def ensure_proxy_tunnel(conn, node, login_host, target_host, target_port, local_port):
     """Start (if needed) the SSH tunnel that exposes the cluster HTTP proxy."""
@@ -110,20 +126,21 @@ rm ~/.ssh_askpass_tunnel
         logging.warning(f"Manual check: ssh {node} 'ss -tln | grep {local_port}'")
 
 def connect_server(host, user, port=None, gateway=None):
-    """ Establish a ssh connect between local and remote head node
-    """
+    """ Establish a ssh connect between local and remote head node """
     conn = Connection(host, user=user, port=port, gateway=gateway)
 
     try:
         conn.open()
     except Exception:
         password = getpass.getpass(f"({user}@{host}) Password: ")
+        # Save the password into connect_kwargs so auto-reconnect works
         conn.connect_kwargs = {'password': password}
         conn.open()
     
     # Set keepalive on the transport after connection is established
+    # Note: keepalive cannot be set in connect_kwargs - it must be set on the transport
     if conn.is_connected and conn.transport:
-        conn.transport.set_keepalive(60)
+        conn.transport.set_keepalive(30)
 
     return conn
 
