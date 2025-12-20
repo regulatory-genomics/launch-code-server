@@ -39,7 +39,7 @@ def ensure_proxy_env_config(conn, local_port):
 
     command = textwrap.dedent(
         f"""
-        bash -lc 'set -e
+        bash -c 'set -e
         rc="$HOME/.bashrc"
         if ! grep -Fq "# >>> launch_code_server proxy >>>" "$rc"; then
 cat <<'EOF' >> "$rc"
@@ -105,7 +105,7 @@ rm ~/.ssh_askpass_tunnel
 def connect_server(host, user, port=None, gateway=None):
     """ Establish a ssh connect between local and remote head node
     """
-    conn = Connection(host, user=user, port=port, gateway=gateway)
+    conn = Connection(host, user=user, port=port, gateway=gateway,connect_kwargs={"keepalive": 60})
 
     try:
         conn.open()
