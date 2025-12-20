@@ -23,33 +23,40 @@ def check_compute(conn, host, port, env_name=None):
 
 def ensure_proxy_env_config(conn, local_port):
     """Ensure the user's .bashrc exports proxy variables on compute nodes."""
-    snippet = textwrap.dedent(
-        f"""
-        # >>> launch_code_server proxy >>>
-        if [[ "$(hostname)" != *"login"* ]]; then
-            export http_proxy=http://127.0.0.1:{local_port}
-            export https_proxy=http://127.0.0.1:{local_port}
-            export HTTP_PROXY=http://127.0.0.1:{local_port}
-            export HTTPS_PROXY=http://127.0.0.1:{local_port}
-            export ALL_PROXY=http://127.0.0.1:{local_port}
-        fi
-        # <<< launch_code_server proxy <<<
-        """
-    ).strip()
 
-    command = textwrap.dedent(
-        f"""
-        bash -c 'set -e
-        rc="$HOME/.bashrc"
-        if ! grep -Fq "# >>> launch_code_server proxy >>>" "$rc"; then
-cat <<'EOF' >> "$rc"
-{snippet}
-EOF
-        fi'
-        """
-    ).strip()
+    # 1. Define the marker we look for
+    marker = "# >>> launch_code_server proxy >>>"
 
-    conn.run(command, hide=False)
+    # 2. Check if the configuration already exists
+    check_cmd = f"grep -Fq '{marker}' ~/.bashrc"
+    result = conn.run(check_cmd, warn=True, hide=True)
+
+    # 3. If grep failed (exit code != 0), append the config
+    if result.failed:
+        logging.info("Appending proxy config to .bashrc...")
+
+        lines_to_add = [
+            f"\n{marker}",
+            f"if [[ \"$(hostname)\" != *\"login\"* ]]; then",
+            f"    export http_proxy=http://127.0.0.1:{local_port}",
+            f"    export https_proxy=http://127.0.0.1:{local_port}",
+            f"    export HTTP_PROXY=http://127.0.0.1:{local_port}",
+            f"    export HTTPS_PROXY=http://127.0.0.1:{local_port}",
+            f"    export ALL_PROXY=http://127.0.0.1:{local_port}",
+            f"fi",
+            f"# <<< launch_code_server proxy <<<\n"
+        ]
+
+        # Join lines
+        block = "\n".join(lines_to_add)
+
+        # Escape BOTH single quotes and double quotes for bash -c 'echo "..." ...'
+        block_escaped = block.replace("'", "'\\''").replace('"', '\\"')
+
+        # Run command
+        conn.run(f"bash -c 'echo \"{block_escaped}\" >> ~/.bashrc'", hide=False)
+    else:
+        logging.info("Proxy config already present in .bashrc.")
 
 def ensure_proxy_tunnel(conn, node, login_host, target_host, target_port, local_port):
     """Start (if needed) the SSH tunnel that exposes the cluster HTTP proxy."""
@@ -105,7 +112,7 @@ rm ~/.ssh_askpass_tunnel
 def connect_server(host, user, port=None, gateway=None):
     """ Establish a ssh connect between local and remote head node
     """
-    conn = Connection(host, user=user, port=port, gateway=gateway,connect_kwargs={"keepalive": 60})
+    conn = Connection(host, user=user, port=port, gateway=gateway)
 
     try:
         conn.open()
@@ -113,6 +120,10 @@ def connect_server(host, user, port=None, gateway=None):
         password = getpass.getpass(f"({user}@{host}) Password: ")
         conn.connect_kwargs = {'password': password}
         conn.open()
+    
+    # Set keepalive on the transport after connection is established
+    if conn.is_connected and conn.transport:
+        conn.transport.set_keepalive(60)
 
     return conn
 
@@ -222,6 +233,10 @@ def main():
             j_pass = getpass.getpass(f"({j_user}@{args.jump_host}) Jump Server Password: ")
             gateway_conn.connect_kwargs = {'password': j_pass}
             gateway_conn.open()
+        
+        # Set keepalive on the gateway connection
+        if gateway_conn.is_connected and gateway_conn.transport:
+            gateway_conn.transport.set_keepalive(60)
             
         logging.info("Jump server connection established.")
 
