@@ -22,57 +22,62 @@ def check_compute(conn, host, port, env_name=None):
     return exec(conn, f"vscode_server check --host {host} --port {port}", env_name=env_name).strip()
 
 def ensure_proxy_env_config(conn, local_port):
-    """Ensure the user's .bashrc exports proxy variables using SFTP."""
-
+    """Ensure the user's .bashrc exports proxy variables on compute nodes."""
     marker = "# >>> launch_code_server proxy >>>"
-
-    # Open an SFTP session (bypasses shell startup scripts)
-    sftp = conn.sftp()
-
+    
+    # Use bash -c with explicit non-interactive mode to bypass .bashrc issues
+    # The -c flag runs a command string and doesn't source .bashrc by default
+    
+    # Test basic command execution first with non-interactive shell
     try:
-        # Read the remote .bashrc file
-        # We assume the file is in the home directory
-        remote_path = ".bashrc"
-
-        try:
-            # Open the remote file for reading
-            with sftp.open(remote_path, 'r') as f:
-                content = f.read().decode('utf-8')
-        except FileNotFoundError:
-            # If .bashrc doesn't exist, start with empty content
-            content = ""
-            logging.warning(f"{remote_path} not found, creating new one.")
-
-        # Check if the marker is already present
-        if marker in content:
-            logging.info("Proxy config already present in .bashrc.")
+        logging.info("Testing connection with simple command...")
+        test_result = run_with_retry(conn, "/bin/bash -c 'echo test'", retries=2, hide=True)
+        if not test_result.ok:
+            logging.warning("Basic command test failed, connection may be unstable")
+            logging.warning("Skipping proxy configuration - you may need to configure it manually")
             return
-
-        logging.info("Appending proxy config to .bashrc via SFTP...")
-
-        # Construct the block to append
-        lines_to_add = [
-            f"\n{marker}",
-            f"if [[ \"$(hostname)\" != *\"login\"* ]]; then",
-            f"    export http_proxy=http://127.0.0.1:{local_port}",
-            f"    export https_proxy=http://127.0.0.1:{local_port}",
-            f"    export HTTP_PROXY=http://127.0.0.1:{local_port}",
-            f"    export HTTPS_PROXY=http://127.0.0.1:{local_port}",
-            f"    export ALL_PROXY=http://127.0.0.1:{local_port}",
-            f"fi",
-            f"# <<< launch_code_server proxy <<<\n"
-        ]
-        block = "\n".join(lines_to_add)
-
-        # Append to the file (open in 'a' append mode)
-        with sftp.open(remote_path, 'a') as f:
-            f.write(block)
-
     except Exception as e:
-        logging.error(f"Failed to update .bashrc via SFTP: {e}")
-        raise e
-    finally:
-        sftp.close()
+        logging.error(f"Connection test failed: {e}")
+        logging.warning("Skipping proxy configuration due to connection instability")
+        logging.warning(f"You can manually add this to your ~/.bashrc on compute nodes:")
+        logging.warning(f"  if [[ \"$(hostname)\" != *\"login\"* ]]; then")
+        logging.warning(f"    export http_proxy=http://127.0.0.1:{local_port}")
+        logging.warning(f"    export https_proxy=http://127.0.0.1:{local_port}")
+        logging.warning(f"  fi")
+        return  # Don't raise, just skip proxy setup
+    
+    # Check if configuration already exists (using non-interactive shell)
+    check_cmd = f"/bin/bash -c 'grep -q \"{marker}\" ~/.bashrc 2>/dev/null'"
+    result = run_with_retry(conn, check_cmd, retries=3, warn=True, hide=True)
+    
+    if result.ok:
+        logging.info("Proxy config already present in .bashrc.")
+        return
+    
+    logging.info("Appending proxy config to .bashrc...")
+    
+    # Create the configuration block
+    config_block = f"""{marker}
+if [[ "$(hostname)" != *"login"* ]]; then
+    export http_proxy=http://127.0.0.1:{local_port}
+    export https_proxy=http://127.0.0.1:{local_port}
+    export HTTP_PROXY=http://127.0.0.1:{local_port}
+    export HTTPS_PROXY=http://127.0.0.1:{local_port}
+    export ALL_PROXY=http://127.0.0.1:{local_port}
+fi
+# <<< launch_code_server proxy <<<"""
+    
+    # Use printf to append (more reliable than cat with heredoc)
+    # Escape the config block for printf
+    escaped_block = config_block.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$')
+    append_cmd = f'/bin/bash -c "printf \"\\n{escaped_block}\\n\" >> ~/.bashrc"'
+    
+    try:
+        run_with_retry(conn, append_cmd, retries=3, hide=False)
+        logging.info("Proxy config successfully added to .bashrc.")
+    except Exception as e:
+        logging.error(f"Failed to update .bashrc: {e}")
+        raise
 
 def ensure_proxy_tunnel(conn, node, login_host, target_host, target_port, local_port):
     """Start (if needed) the SSH tunnel that exposes the cluster HTTP proxy."""
@@ -127,22 +132,76 @@ rm ~/.ssh_askpass_tunnel
 
 def connect_server(host, user, port=None, gateway=None):
     """ Establish a ssh connect between local and remote head node """
-    conn = Connection(host, user=user, port=port, gateway=gateway)
+    password = None
+    
+    # Try key-based auth first
+    conn = Connection(
+        host, 
+        user=user, 
+        port=port, 
+        gateway=gateway,
+        inline_ssh_env=True,  # Pass environment variables directly, not through shell
+        connect_timeout=30  # Increase timeout to 30 seconds
+    )
 
     try:
         conn.open()
     except Exception:
+        # Key-based auth failed, try password
         password = getpass.getpass(f"({user}@{host}) Password: ")
-        # Save the password into connect_kwargs so auto-reconnect works
-        conn.connect_kwargs = {'password': password}
+        # Set password in connect_kwargs - this will be used for auto-reconnect
+        # Also disable key-based auth to avoid conflicts
+        conn.connect_kwargs = {
+            'password': password,
+            'allow_agent': False,
+            'look_for_keys': False
+        }
         conn.open()
     
     # Set keepalive on the transport after connection is established
     # Note: keepalive cannot be set in connect_kwargs - it must be set on the transport
     if conn.is_connected and conn.transport:
         conn.transport.set_keepalive(30)
+    
+    # Store password for potential reconnection attempts in our retry logic
+    if password:
+        conn._stored_password = password
+    else:
+        # Even if we connected with keys, we might need password later
+        # Check if password is already in connect_kwargs
+        if 'password' in conn.connect_kwargs:
+            conn._stored_password = conn.connect_kwargs['password']
 
     return conn
+
+def run_with_retry(conn, command, retries=3, **kwargs):
+    """Run a command with retry logic for connection issues."""
+    for attempt in range(retries):
+        try:
+            return conn.run(command, **kwargs)
+        except Exception as e:
+            if attempt < retries - 1:
+                logging.warning(f"Command failed (attempt {attempt + 1}/{retries}), retrying: {e}")
+                time.sleep(2)
+                # Try to reconnect
+                try:
+                    if not conn.is_connected:
+                        # Ensure password is in connect_kwargs for reconnection
+                        if hasattr(conn, '_stored_password') and conn._stored_password:
+                            conn.connect_kwargs = {
+                                'password': conn._stored_password,
+                                'allow_agent': False,
+                                'look_for_keys': False
+                            }
+                        conn.open()
+                        # Reset keepalive after reconnection
+                        if conn.is_connected and conn.transport:
+                            conn.transport.set_keepalive(30)
+                except Exception as reconnect_error:
+                    logging.warning(f"Reconnection failed: {reconnect_error}")
+            else:
+                logging.error(f"Command failed after {retries} attempts")
+                raise
 
 def exec(conn, code, env_name=None):
     """ Convenient wrapper to execute arbitrary python code on a remote
@@ -159,7 +218,8 @@ def exec(conn, code, env_name=None):
     tmp = sys.stdout
     output = StringIO()
     sys.stdout = output
-    conn.run(code, out_stream=sys.stdout, hide='err')
+    # Use run_with_retry to handle connection drops
+    run_with_retry(conn, code, retries=3, out_stream=sys.stdout, hide='err')
     sys.stdout = tmp
     return output.getvalue()
 
@@ -261,6 +321,10 @@ def main():
     if gateway_conn:
         logging.info(f"Connecting to target: {host} via gateway...")
     conn = connect_server(host, user, args.port, gateway=gateway_conn)
+    
+    # Wait for connection to stabilize before running commands
+    logging.info("Waiting for connection to stabilize...")
+    time.sleep(2)
 
     if args.setup_proxy:
         logging.info("Ensuring proxy environment variables are configured...")
