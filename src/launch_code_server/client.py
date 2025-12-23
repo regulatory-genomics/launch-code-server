@@ -1,44 +1,225 @@
 import argparse
 import getpass
+import logging
+import shlex
+import sys
+import textwrap
+import time
+from io import StringIO
+from os.path import expanduser
+
 from fabric import Connection
 from sshconf import read_ssh_config
-from os.path import expanduser
-from io import StringIO
-import sys
-import time
-import logging
 
-def launch_compute(conn, partition, n_cpus, memory_per_cpu, node, timeout=300):
+def launch_compute(conn, partition, n_cpus, memory_per_cpu, node, timeout=300, env_name=None):
     partition = '' if partition is None else f'--partition {partition}'
     compute_node = '' if node is None else f'--compute_node {node}'
-    output = exec(conn, f"vscode_server launch {partition} --number_of_cpus {n_cpus} --timeout {timeout} --memory_per_cpu {memory_per_cpu} {compute_node}")
+    output = exec(conn, f"vscode_server launch {partition} --number_of_cpus {n_cpus} --timeout {timeout} --memory_per_cpu {memory_per_cpu} {compute_node}", env_name=env_name)
     job_id, node, port = output.strip().split('\t')
     return (int(job_id), node, int(port))
 
-def check_compute(conn, host, port):
-    return exec(conn, f"vscode_server check --host {host} --port {port}").strip()
+def check_compute(conn, host, port, env_name=None):
+    return exec(conn, f"vscode_server check --host {host} --port {port}", env_name=env_name).strip()
 
-def connect_server(host, user, port=None):
-    """ Establish a ssh connect between local and remote head node
+def ensure_proxy_env_config(conn, local_port):
+    """Ensure the user's .bashrc exports proxy variables on compute nodes."""
+    marker = "# >>> launch_code_server proxy >>>"
+    
+    # Use bash -c with explicit non-interactive mode to bypass .bashrc issues
+    # The -c flag runs a command string and doesn't source .bashrc by default
+    
+    # Test basic command execution first with non-interactive shell
+    try:
+        logging.info("Testing connection with simple command...")
+        test_result = run_with_retry(conn, "/bin/bash -c 'echo test'", retries=2, hide=True)
+        if not test_result.ok:
+            logging.warning("Basic command test failed, connection may be unstable")
+            logging.warning("Skipping proxy configuration - you may need to configure it manually")
+            return
+    except Exception as e:
+        logging.error(f"Connection test failed: {e}")
+        logging.warning("Skipping proxy configuration due to connection instability")
+        logging.warning(f"You can manually add this to your ~/.bashrc on compute nodes:")
+        logging.warning(f"  if [[ \"$(hostname)\" != *\"login\"* ]]; then")
+        logging.warning(f"    export http_proxy=http://127.0.0.1:{local_port}")
+        logging.warning(f"    export https_proxy=http://127.0.0.1:{local_port}")
+        logging.warning(f"  fi")
+        return  # Don't raise, just skip proxy setup
+    
+    # Check if configuration already exists (using non-interactive shell)
+    check_cmd = f"/bin/bash -c 'grep -q \"{marker}\" ~/.bashrc 2>/dev/null'"
+    result = run_with_retry(conn, check_cmd, retries=3, warn=True, hide=True)
+    
+    if result.ok:
+        logging.info("Proxy config already present in .bashrc.")
+        return
+    
+    logging.info("Appending proxy config to .bashrc...")
+    
+    # Create the configuration block
+    config_block = f"""{marker}
+if [[ "$(hostname)" != *"login"* ]]; then
+    export http_proxy=http://127.0.0.1:{local_port}
+    export https_proxy=http://127.0.0.1:{local_port}
+    export HTTP_PROXY=http://127.0.0.1:{local_port}
+    export HTTPS_PROXY=http://127.0.0.1:{local_port}
+    export ALL_PROXY=http://127.0.0.1:{local_port}
+fi
+# <<< launch_code_server proxy <<<"""
+    
+    # Use printf to append (more reliable than cat with heredoc)
+    # Escape the config block for printf
+    escaped_block = config_block.replace('\\', '\\\\').replace('"', '\\"').replace('$', '\\$')
+    append_cmd = f'/bin/bash -c "printf \"\\n{escaped_block}\\n\" >> ~/.bashrc"'
+    
+    try:
+        run_with_retry(conn, append_cmd, retries=3, hide=False)
+        logging.info("Proxy config successfully added to .bashrc.")
+    except Exception as e:
+        logging.error(f"Failed to update .bashrc: {e}")
+        raise
+
+def ensure_proxy_tunnel(conn, node, login_host, target_host, target_port, local_port):
+    """Start (if needed) the SSH tunnel that exposes the cluster HTTP proxy."""
+    # First check if tunnel is already running - look for actual LISTEN socket
+    check_cmd = f"ss -tln | grep ':{local_port} '"
+    result = conn.run(f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {node} '{check_cmd}'", hide=True, warn=True)
+    
+    # Check if we got actual output showing a listening socket
+    if result.stdout.strip() and "LISTEN" in result.stdout:
+        logging.info(f"Proxy tunnel already running on port {local_port}")
+        return
+
+    # Prompt for OTP locally
+    otp = getpass.getpass(f"Enter OATH OTP for tunnel on {node}: ")
+    
+    logging.info("Starting proxy tunnel with provided OTP...")
+
+    # Use SSH_ASKPASS with a helper script to handle OTP prompt non-interactively
+    askpass_script = textwrap.dedent(f"""
+        #!/bin/bash
+        echo "{otp}"
+    """).strip()
+
+    setup_cmds = f"""
+cat <<'EOF' > ~/.ssh_askpass_tunnel
+{askpass_script}
+EOF
+chmod +x ~/.ssh_askpass_tunnel
+export SSH_ASKPASS=~/.ssh_askpass_tunnel
+export DISPLAY=:0  # SSH_ASKPASS needs DISPLAY set (even dummy) or setsid
+setsid ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=keyboard-interactive,password -N -f -L {local_port}:{target_host}:{target_port} {login_host} < /dev/null
+rm ~/.ssh_askpass_tunnel
     """
-    conn = Connection(host, user=user, port=port)
+
+    full_cmd = f"ssh -tt -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {node} {shlex.quote(setup_cmds)}"
+    
+    conn.run(full_cmd, pty=True, warn=True)
+    
+    # Wait for tunnel to bind
+    logging.info("Waiting for tunnel to establish...")
+    time.sleep(3)
+    
+    # Verify tunnel is running
+    verify_cmd = f"ss -tln | grep ':{local_port} '"
+    result = conn.run(f"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null {node} '{verify_cmd}'", hide=True, warn=True)
+    
+    if result.stdout.strip() and "LISTEN" in result.stdout:
+        logging.info(f"Proxy tunnel successfully established on {node}:{local_port}")
+    else:
+        logging.warning(f"Could not verify proxy tunnel on {node}:{local_port}")
+        logging.warning(f"Manual check: ssh {node} 'ss -tln | grep {local_port}'")
+
+def connect_server(host, user, port=None, gateway=None):
+    """ Establish a ssh connect between local and remote head node """
+    password = None
+    
+    # Try key-based auth first
+    conn = Connection(
+        host, 
+        user=user, 
+        port=port, 
+        gateway=gateway,
+        inline_ssh_env=True,  # Pass environment variables directly, not through shell
+        connect_timeout=30  # Increase timeout to 30 seconds
+    )
 
     try:
         conn.open()
     except Exception:
+        # Key-based auth failed, try password
         password = getpass.getpass(f"({user}@{host}) Password: ")
-        conn.connect_kwargs = {'password': password}
+        # Set password in connect_kwargs - this will be used for auto-reconnect
+        # Also disable key-based auth to avoid conflicts
+        conn.connect_kwargs = {
+            'password': password,
+            'allow_agent': False,
+            'look_for_keys': False
+        }
         conn.open()
+    
+    # Set keepalive on the transport after connection is established
+    # Note: keepalive cannot be set in connect_kwargs - it must be set on the transport
+    if conn.is_connected and conn.transport:
+        conn.transport.set_keepalive(30)
+    
+    # Store password for potential reconnection attempts in our retry logic
+    if password:
+        conn._stored_password = password
+    else:
+        # Even if we connected with keys, we might need password later
+        # Check if password is already in connect_kwargs
+        if 'password' in conn.connect_kwargs:
+            conn._stored_password = conn.connect_kwargs['password']
 
     return conn
 
-def exec(conn, code):
+def run_with_retry(conn, command, retries=3, **kwargs):
+    """Run a command with retry logic for connection issues."""
+    for attempt in range(retries):
+        try:
+            return conn.run(command, **kwargs)
+        except Exception as e:
+            if attempt < retries - 1:
+                logging.warning(f"Command failed (attempt {attempt + 1}/{retries}), retrying: {e}")
+                time.sleep(2)
+                # Try to reconnect
+                try:
+                    if not conn.is_connected:
+                        # Ensure password is in connect_kwargs for reconnection
+                        if hasattr(conn, '_stored_password') and conn._stored_password:
+                            conn.connect_kwargs = {
+                                'password': conn._stored_password,
+                                'allow_agent': False,
+                                'look_for_keys': False
+                            }
+                        conn.open()
+                        # Reset keepalive after reconnection
+                        if conn.is_connected and conn.transport:
+                            conn.transport.set_keepalive(30)
+                except Exception as reconnect_error:
+                    logging.warning(f"Reconnection failed: {reconnect_error}")
+            else:
+                logging.error(f"Command failed after {retries} attempts")
+                raise
+
+def exec(conn, code, env_name=None):
     """ Convenient wrapper to execute arbitrary python code on a remote
     """
+    # If environment name is provided, activate micromamba environment before running command
+    if env_name:
+        # Use bash -c to properly handle environment activation
+        # Preserve original PATH and add common system directories to ensure system commands like sbatch are available
+        # Escape single quotes in the command by replacing them with '\''
+        escaped_code = code.replace("'", "'\"'\"'")
+        # Add common system paths to ensure sbatch and other system commands are found
+        code = f"bash -c 'ORIG_PATH=\"$PATH\" && source $(micromamba shell hook --shell bash 2>/dev/null || echo ~/.bashrc) && micromamba activate {env_name} && export PATH=\"$PATH:/usr/bin:/bin:/usr/local/bin:/opt/slurm/bin:/usr/sbin:/sbin:$ORIG_PATH\" && {escaped_code}'"
+    
     tmp = sys.stdout
     output = StringIO()
     sys.stdout = output
-    conn.run(code, out_stream=sys.stdout, hide='err')
+    # Use run_with_retry to handle connection drops
+    run_with_retry(conn, code, retries=3, out_stream=sys.stdout, hide='err')
     sys.stdout = tmp
     return output.getvalue()
 
@@ -90,6 +271,15 @@ def main():
     parser.add_argument("--compute-node", type=str, help="Hostname of compute node to reserve.")
     parser.add_argument("-n", "--num-cpus", type=int, default=1, help="Number of CPUs requested for the job.")
     parser.add_argument("-m", "--memory_per_cpu", type=str, default="8G", help="Memory per cpu requested for the job.")
+    parser.add_argument("--env", "--micromamba-env", type=str, dest="env_name", help="Micromamba environment name to activate before running commands.")
+    parser.add_argument("--setup-proxy", action="store_true", help="Automatically configure HTTP proxy tunnel on compute nodes.")
+    parser.add_argument("--proxy-login-host", type=str, default="login01", help="Login host used to reach the HTTP proxy.")
+    parser.add_argument("--proxy-target-host", type=str, default="172.16.75.119", help="Internal HTTP proxy host.")
+    parser.add_argument("--proxy-target-port", type=int, default=3128, help="Internal HTTP proxy port.")
+    parser.add_argument("--proxy-local-port", type=int, default=9999, help="Local port on compute nodes that exposes the HTTP proxy.")
+    parser.add_argument("--jump-host", type=str, help="Jump server address")
+    parser.add_argument("--jump-port", type=int, default=22, help="Jump server port")
+    parser.add_argument("--jump-user", type=str, help="User for jump server (defaults to target user if not specified)")
     args = parser.parse_args()
 
     destination = args.destination.split('@')
@@ -101,21 +291,73 @@ def main():
     else:
         raise ValueError("Invalid destination format. Please provide the hostname or username@hostname.")
 
-    conn = connect_server(host, user, args.port)
+    # Handle jump server connection
+    gateway_conn = None
+    if args.jump_host:
+        logging.info(f"Connecting to jump server: {args.jump_host}:{args.jump_port}...")
+        
+        # Determine jump user (default to same as target user)
+        j_user = args.jump_user if args.jump_user else user
+        
+        # Create the connection object for the jump server
+        gateway_conn = Connection(args.jump_host, user=j_user, port=args.jump_port)
+        
+        # Authenticate to the Jump Server
+        try:
+            gateway_conn.open()
+        except Exception:
+            # Prompt for Jump Server password
+            j_pass = getpass.getpass(f"({j_user}@{args.jump_host}) Jump Server Password: ")
+            gateway_conn.connect_kwargs = {'password': j_pass}
+            gateway_conn.open()
+        
+        # Set keepalive on the gateway connection
+        if gateway_conn.is_connected and gateway_conn.transport:
+            gateway_conn.transport.set_keepalive(60)
+            
+        logging.info("Jump server connection established.")
+
+    # Connect to the actual HPC head node, passing the jump connection as the gateway
+    if gateway_conn:
+        logging.info(f"Connecting to target: {host} via gateway...")
+    conn = connect_server(host, user, args.port, gateway=gateway_conn)
+    
+    # Wait for connection to stabilize before running commands
+    logging.info("Waiting for connection to stabilize...")
+    time.sleep(2)
+
+    if args.setup_proxy:
+        logging.info("Ensuring proxy environment variables are configured...")
+        ensure_proxy_env_config(conn, args.proxy_local_port)
 
     logging.info("Trying to reserve a remote compute node...")
-    job_id, node, port = launch_compute(conn, args.partition, args.num_cpus, args.memory_per_cpu, args.compute_node)
+    job_id, node, port = launch_compute(conn, args.partition, args.num_cpus, args.memory_per_cpu, args.compute_node, env_name=args.env_name)
     logging.info(f"A job (id={job_id}) has been reserved on node {node}")
+
+    if args.setup_proxy:
+        logging.info("Setting up proxy tunnel on compute node...")
+        try:
+            ensure_proxy_tunnel(
+                conn,
+                node,
+                args.proxy_login_host,
+                args.proxy_target_host,
+                args.proxy_target_port,
+                args.proxy_local_port,
+            )
+        except Exception as err:
+            logging.warning(f"Failed to configure proxy tunnel: {err}")
+            logging.info(f"You can manually run on {node}: ssh -N -L {args.proxy_local_port}:{args.proxy_target_host}:{args.proxy_target_port} {args.proxy_login_host}")
     with conn.forward_local(args.forward_port, 22, remote_host=node):
         logging.info(f"Setup port forwarding: localhost:{args.forward_port} => {node}:22")
         update_ssh_config(user, args.forward_port)
 
         logging.info("Press Ctrl+D to quit and shutdown the node...")
         patience = 3
-        time.sleep(30)
+        time.sleep(15)
         while True:
             try:
-                response = check_compute(conn, node, port)
+                response = check_compute(conn, node, port, env_name=args.env_name)
                 if not response.startswith('SUCCESS'):
                     logging.error(f"An error occurred during the communication with the remote server: {response}")
                     sys.exit(1)
