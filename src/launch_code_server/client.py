@@ -206,19 +206,45 @@ def run_with_retry(conn, command, retries=3, **kwargs):
 def exec(conn, code, env_name=None):
     """ Convenient wrapper to execute arbitrary python code on a remote
     """
-    # If environment name is provided, activate micromamba environment before running command
     if env_name:
-        # Use bash -c to properly handle environment activation
-        # Preserve original PATH and add common system directories to ensure system commands like sbatch are available
-        # Escape single quotes in the command by replacing them with '\''
         escaped_code = code.replace("'", "'\"'\"'")
-        # Add common system paths to ensure sbatch and other system commands are found
-        code = f"bash -c 'ORIG_PATH=\"$PATH\" && source $(micromamba shell hook --shell bash 2>/dev/null || echo ~/.bashrc) && micromamba activate {env_name} && export PATH=\"$PATH:/usr/bin:/bin:/usr/local/bin:/opt/slurm/bin:/usr/sbin:/sbin:$ORIG_PATH\" && {escaped_code}'"
+        
+        # We build a robust shell command that runs on the remote server:
+        # 1. Start a Login Shell (bash -l) to load ~/.bashrc and PATH.
+        # 2. Search for the package manager in priority order.
+        # 3. Generate the activation hook using the correct syntax.
+        shell_cmd = (
+            f"bash -l -c '"
+            # --- Discovery Logic ---
+            f"MGR=\"\"; "
+            f"for cmd in micromamba mamba conda; do "
+            f"    if command -v $cmd &> /dev/null; then MGR=$cmd; break; fi; "
+            f"done; "
+            
+            # --- Fallback to Environment Variables if 'command -v' failed ---
+            f"if [ -z \"$MGR\" ]; then "
+            f"    if [ -n \"$MAMBA_EXE\" ]; then MGR=\"$MAMBA_EXE\"; "
+            f"    elif [ -n \"$CONDA_EXE\" ]; then MGR=\"$CONDA_EXE\"; "
+            f"    else echo \"Error: No conda/mamba/micromamba found in PATH or env vars.\"; exit 127; fi; "
+            f"fi; "
+            # --- Activation Logic ---
+            # Micromamba uses 'shell hook', Conda/Mamba use 'shell.bash hook'
+            f"if [[ \"$MGR\" == *\"micromamba\"* ]]; then "
+            f"    eval \"$($MGR shell hook --shell bash)\"; "
+            f"else "
+            f"    eval \"$($MGR shell.bash hook)\"; "
+            f"fi && "
+            
+            f"$MGR activate {env_name} && "
+            f"{escaped_code}'"
+        )
+        
+        # Override the code to be executed
+        code = shell_cmd
     
     tmp = sys.stdout
     output = StringIO()
     sys.stdout = output
-    # Use run_with_retry to handle connection drops
     run_with_retry(conn, code, retries=3, out_stream=sys.stdout, hide='err')
     sys.stdout = tmp
     return output.getvalue()
