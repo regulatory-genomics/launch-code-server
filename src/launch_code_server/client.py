@@ -141,7 +141,7 @@ def connect_server(host, user, port=None, gateway=None):
         port=port, 
         gateway=gateway,
         inline_ssh_env=True,  # Pass environment variables directly, not through shell
-        connect_timeout=30  # Increase timeout to 30 seconds
+        connect_timeout=90  # Increase timeout to 30 seconds
     )
 
     try:
@@ -298,6 +298,7 @@ def main():
     parser.add_argument("-n", "--num-cpus", type=int, default=1, help="Number of CPUs requested for the job.")
     parser.add_argument("-m", "--memory_per_cpu", type=str, default="8G", help="Memory per cpu requested for the job.")
     parser.add_argument("--env", "--micromamba-env", type=str, dest="env_name", help="Micromamba environment name to activate before running commands.")
+    parser.add_argument("--timeout", type=int, default=3000, help="Server idle timeout in seconds (default: 300).")
     parser.add_argument("--setup-proxy", action="store_true", help="Automatically configure HTTP proxy tunnel on compute nodes.")
     parser.add_argument("--proxy-login-host", type=str, default="login01", help="Login host used to reach the HTTP proxy.")
     parser.add_argument("--proxy-target-host", type=str, default="172.16.75.119", help="Internal HTTP proxy host.")
@@ -357,7 +358,7 @@ def main():
         ensure_proxy_env_config(conn, args.proxy_local_port)
 
     logging.info("Trying to reserve a remote compute node...")
-    job_id, node, port = launch_compute(conn, args.partition, args.num_cpus, args.memory_per_cpu, args.compute_node, env_name=args.env_name)
+    job_id, node, port = launch_compute(conn, args.partition, args.num_cpus, args.memory_per_cpu, args.compute_node, timeout=args.timeout, env_name=args.env_name)
     logging.info(f"A job (id={job_id}) has been reserved on node {node}")
 
     if args.setup_proxy:
