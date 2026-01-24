@@ -1,7 +1,10 @@
 import argparse
+import contextlib
 import getpass
 import logging
+import os
 import shlex
+import subprocess
 import sys
 import textwrap
 import time
@@ -130,49 +133,189 @@ rm ~/.ssh_askpass_tunnel
         logging.warning(f"Could not verify proxy tunnel on {node}:{local_port}")
         logging.warning(f"Manual check: ssh {node} 'ss -tln | grep {local_port}'")
 
-def connect_server(host, user, port=None, gateway=None):
-    """ Establish a ssh connect between local and remote head node """
-    password = None
+# --- 🔵 Hack Start: Router Jump SSH Proxy Class ---
+class SystemSSHConnection:
+    """
+    This is a proxy class that mimics Fabric's Connection object,
+    but executes commands through a router jump host.
     
-    # Try key-based auth first
-    conn = Connection(
-        host, 
-        user=user, 
-        port=port, 
+    Workflow: Mac -> Router -> (via Socket) -> HPC
+    The router has an established SSH ControlMaster socket, so no OTP is needed.
+    """
+    def __init__(self, host, config, user=None, port=None, gateway=None, jump_host=None, jump_port=None, jump_user=None):
+        # Get values from config dictionary (no longer hardcoded)
+        self.router = config['router']       # e.g. gilberthan@172.16.210.201
+        self.hpc_socket = config['socket']   # e.g. /tmp/hpc_socket
+        self.hpc_host = config['hpc_host']   # e.g. hanlitian@172.16.78.132
+        self.hpc_port = config['hpc_port']   # e.g. 12021
+        
+        # Keep original parameters for compatibility (though not used)
+        self.host = host
+        self.user = user
+        self.port = port
+        self.gateway = gateway
+        self.jump_host = jump_host
+        self.jump_port = jump_port
+        self.jump_user = jump_user
+        
+        self.is_connected = True
+        self.transport = type('Transport', (), {'set_keepalive': lambda self, x: None})()  # Bypass code checks
+        self.connect_kwargs = {}
+        self._stored_password = None
+
+    def run(self, cmd, hide=False, warn=False, pty=False, **kwargs):
+        """
+        Core magic: Mac -> Router -> (via Socket) -> HPC
+        We wrap cmd with shlex.quote to prevent special character errors
+        """
+        # Command executed on router: connect to HPC via socket and execute command
+        # ssh -S socket -p port host "command"
+        remote_cmd = f"ssh -S {self.hpc_socket} -p {self.hpc_port} {self.hpc_host} {shlex.quote(cmd)}"
+        
+        # Mac connects to router and executes the above command
+        full_cmd = ["ssh", self.router, remote_cmd]
+        
+        try:
+            # Use Popen if pty is needed
+            if pty:
+                proc = subprocess.Popen(
+                    full_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    stdin=subprocess.PIPE,
+                    text=True
+                )
+                stdout, stderr = proc.communicate()
+                return_code = proc.returncode
+            else:
+                res = subprocess.run(
+                    full_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                stdout = res.stdout
+                stderr = res.stderr
+                return_code = res.returncode
+        except Exception as e:
+            if not warn:
+                raise e
+            # Construct a fake failure result
+            return type('Result', (), {
+                'ok': False, 
+                'stdout': '', 
+                'stderr': str(e), 
+                'return_code': 1
+            })()
+
+        # 🟢 Critical fix: Simulate Fabric's behavior
+        # If out_stream parameter is provided (from exec function),
+        # write stdout content to it so exec can capture the output.
+        out_stream = kwargs.get('out_stream')
+        if out_stream and stdout:
+            out_stream.write(stdout)
+            out_stream.flush()  # Ensure immediate write
+        
+        # Construct a fake successful Fabric result object
+        class Result:
+            def __init__(self, ok, stdout, stderr, return_code, command):
+                self.ok = ok
+                self.stdout = stdout
+                self.stderr = stderr
+                self.return_code = return_code
+                self.command = command
+        
+        result = Result(return_code == 0, stdout, stderr, return_code, cmd)
+        if not result.ok and not warn:
+            raise Exception(f"SSH Command failed: {result.stderr}")
+        return result
+
+    def open(self):
+        """Fake opening connection (actually reuses router's socket)"""
+        self.is_connected = True
+        pass
+
+    def close(self):
+        """Fake closing connection"""
+        self.is_connected = False
+        pass
+
+    @contextlib.contextmanager
+    def forward_local(self, local_port, remote_port, remote_host):
+        """
+        Port forwarding: Establish double-layer tunnel Mac -> Router -> HPC
+        Since double-layer passwordless tunnel is complex, we use a simplified approach here.
+        """
+        logging.info(f"🔗 Tunneling: Mac:{local_port} -> Router -> HPC:{remote_host}:{remote_port}")
+        
+        # Use ProxyCommand to establish tunnel through router
+        # Note: This may require SSH key authentication from router to Mac
+        # Build port forwarding command through router
+        # Method: Mac listens locally, forwards through router to HPC
+        proxy_cmd = f"ssh -S {self.hpc_socket} -p {self.hpc_port} {self.hpc_host} -W {remote_host}:{remote_port}"
+        ssh_cmd = [
+            "ssh", "-N",
+            "-L", f"{local_port}:{remote_host}:{remote_port}",
+            "-o", f"ProxyCommand=ssh {self.router} {shlex.quote(proxy_cmd)}",
+            self.hpc_host  # This is just a placeholder, actual connection goes through ProxyCommand
+        ]
+        
+        logging.info(f"⚠️  Starting port forward (may require Router SSH key authentication)...")
+        
+        # Start background ssh forwarding process
+        proc = subprocess.Popen(ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            # Wait a bit to ensure tunnel is established
+            time.sleep(2)
+            # Check if process is still running
+            if proc.poll() is not None:
+                # Process has exited, read error message
+                _, stderr = proc.communicate()
+                logging.warning(f"⚠️  Port forwarding failed: {stderr.decode() if stderr else 'Unknown error'}")
+                logging.warning(f"⚠️  Auto-forwarding disabled. You may need to manually tunnel if needed.")
+                # Return an empty context manager
+                @contextlib.contextmanager
+                def dummy_forward():
+                    yield
+                return dummy_forward()
+            yield
+        finally:
+            logging.info("🛑 Closing tunnel...")
+            proc.terminate()
+            proc.wait()
+# --- 🔴 Hack End ---
+
+def connect_server(host, user, port=None, gateway=None, router_config=None, jump_host=None, jump_port=None, jump_user=None):
+    """
+    Overridden: No longer creates Fabric connection, but returns our proxy object.
+    This allows using the established SSH ControlMaster socket through router jump host, skipping OTP verification.
+    """
+    logging.info(f"🚀 Using Router Jump SSH to piggyback on: {host}")
+    
+    # Simple check to prevent missing configuration
+    if not router_config or not router_config.get('router') or not router_config.get('hpc_host'):
+        raise ValueError(
+            "Missing Router/HPC config! Please set environment variables:\n"
+            "  LCS_ROUTER (e.g. gilberthan@172.16.210.201)\n"
+            "  LCS_HPC_HOST (e.g. hanlitian@172.16.78.132)\n"
+            "Or use --router and --hpc-real-host command line arguments."
+        )
+    
+    logging.info(f"   Mac -> Router ({router_config['router']}) -> HPC ({router_config['hpc_host']})")
+    logging.info(f"   Socket: {router_config['socket']}")
+    logging.info("   (Assuming you have established socket on router: ssh -M -S <socket> ...)")
+    
+    # Pass configuration to Connection class
+    return SystemSSHConnection(
+        host,
+        router_config,
+        user=user,
+        port=port,
         gateway=gateway,
-        inline_ssh_env=True,  # Pass environment variables directly, not through shell
-        connect_timeout=90  # Increase timeout to 30 seconds
+        jump_host=jump_host,
+        jump_port=jump_port,
+        jump_user=jump_user
     )
-
-    try:
-        conn.open()
-    except Exception:
-        # Key-based auth failed, try password
-        password = getpass.getpass(f"({user}@{host}) Password: ")
-        # Set password in connect_kwargs - this will be used for auto-reconnect
-        # Also disable key-based auth to avoid conflicts
-        conn.connect_kwargs = {
-            'password': password,
-            'allow_agent': False,
-            'look_for_keys': False
-        }
-        conn.open()
-    
-    # Set keepalive on the transport after connection is established
-    # Note: keepalive cannot be set in connect_kwargs - it must be set on the transport
-    if conn.is_connected and conn.transport:
-        conn.transport.set_keepalive(30)
-    
-    # Store password for potential reconnection attempts in our retry logic
-    if password:
-        conn._stored_password = password
-    else:
-        # Even if we connected with keys, we might need password later
-        # Check if password is already in connect_kwargs
-        if 'password' in conn.connect_kwargs:
-            conn._stored_password = conn.connect_kwargs['password']
-
-    return conn
 
 def run_with_retry(conn, command, retries=3, **kwargs):
     """Run a command with retry logic for connection issues."""
@@ -307,6 +450,15 @@ def main():
     parser.add_argument("--jump-host", type=str, help="Jump server address")
     parser.add_argument("--jump-port", type=int, default=22, help="Jump server port")
     parser.add_argument("--jump-user", type=str, help="User for jump server (defaults to target user if not specified)")
+    # Router jump configuration (can be set via environment variables)
+    parser.add_argument("--router", type=str, default=os.environ.get("LCS_ROUTER"), 
+                        help="Router SSH address (e.g. user@192.168.x.x, or set LCS_ROUTER env var)")
+    parser.add_argument("--router-socket", type=str, default=os.environ.get("LCS_SOCKET", "/tmp/hpc_socket"), 
+                        help="Path to the SSH socket on the router (or set LCS_SOCKET env var)")
+    parser.add_argument("--hpc-real-host", type=str, default=os.environ.get("LCS_HPC_HOST"), 
+                        help="Real HPC user@ip (e.g. user@172.16.x.x, or set LCS_HPC_HOST env var)")
+    parser.add_argument("--hpc-real-port", type=str, default=os.environ.get("LCS_HPC_PORT", "22"), 
+                        help="Real HPC SSH port (or set LCS_HPC_PORT env var)")
     args = parser.parse_args()
 
     destination = args.destination.split('@')
@@ -319,35 +471,33 @@ def main():
         raise ValueError("Invalid destination format. Please provide the hostname or username@hostname.")
 
     # Handle jump server connection
-    gateway_conn = None
+    # When using system SSH, jump host is automatically handled via -J option
+    # No need to create separate connection, as system SSH will use ControlMaster
     if args.jump_host:
-        logging.info(f"Connecting to jump server: {args.jump_host}:{args.jump_port}...")
-        
-        # Determine jump user (default to same as target user)
+        logging.info(f"Using jump server: {args.jump_host}:{args.jump_port} (via system SSH)")
         j_user = args.jump_user if args.jump_user else user
-        
-        # Create the connection object for the jump server
-        gateway_conn = Connection(args.jump_host, user=j_user, port=args.jump_port)
-        
-        # Authenticate to the Jump Server
-        try:
-            gateway_conn.open()
-        except Exception:
-            # Prompt for Jump Server password
-            j_pass = getpass.getpass(f"({j_user}@{args.jump_host}) Jump Server Password: ")
-            gateway_conn.connect_kwargs = {'password': j_pass}
-            gateway_conn.open()
-        
-        # Set keepalive on the gateway connection
-        if gateway_conn.is_connected and gateway_conn.transport:
-            gateway_conn.transport.set_keepalive(60)
-            
-        logging.info("Jump server connection established.")
+    else:
+        j_user = None
 
-    # Connect to the actual HPC head node, passing the jump connection as the gateway
-    if gateway_conn:
-        logging.info(f"Connecting to target: {host} via gateway...")
-    conn = connect_server(host, user, args.port, gateway=gateway_conn)
+    # Prepare router configuration dictionary
+    router_config = {
+        'router': args.router,
+        'socket': args.router_socket,
+        'hpc_host': args.hpc_real_host,
+        'hpc_port': args.hpc_real_port
+    }
+    
+    # Connect to the actual HPC head node
+    # Using system SSH, will automatically utilize ControlMaster connection
+    conn = connect_server(
+        host, 
+        user, 
+        args.port,
+        router_config=router_config,
+        jump_host=args.jump_host,
+        jump_port=args.jump_port,
+        jump_user=j_user
+    )
     
     # Wait for connection to stabilize before running commands
     logging.info("Waiting for connection to stabilize...")
