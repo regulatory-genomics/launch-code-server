@@ -140,39 +140,59 @@ class RouterSocketExecutor(SSHExecutor):
     def forward_local(self, local_port: int, remote_port: int, remote_host: str):
         """
         Sets up a port forward tunnel: Local -> Router -> HPC
+        Enhanced with better error handling and connection stability.
         """
-        logging.info(f"🔗 Establishing Tunnel: localhost:{local_port} -> Router -> {remote_host}:{remote_port}")
+        logging.info(f"🔗 Tunneling: localhost:{local_port} -> Router -> {remote_host}:{remote_port}")
         
-        # The ProxyCommand allows us to hop through the router to the final destination
-        # while using the socket for the router->HPC leg.
-        proxy_cmd = f"ssh -S {self.config.socket_path} -p {self.config.hpc_port} {self.config.hpc_host} -W {remote_host}:{remote_port}"
-        
-        ssh_cmd = [
-            "ssh", "-N",
-            "-L", f"{local_port}:{remote_host}:{remote_port}",
-            "-o", f"ProxyCommand=ssh {self.config.address} {shlex.quote(proxy_cmd)}",
-            "placeholder-dest"  # ProxyCommand handles the actual connection
-        ]
-
-        proc = subprocess.Popen(ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # 1. Extract HPC username (new logic)
+        # Extract "hanlitian" from "hanlitian@172.16.78.132"
         try:
-            time.sleep(2)
+            hpc_user = self.config.hpc_host.split('@')[0]
+        except IndexError:
+            hpc_user = "root"  # Fallback, though unlikely to happen
+        
+        # 2. Construct ProxyCommand (unchanged)
+        # This tells the router to use the Socket channel to forward traffic to HPC compute node
+        # Note: Added -q (quiet mode) to prevent unnecessary output interference
+        proxy_cmd = f"ssh -q -S {self.config.socket_path} -p {self.config.hpc_port} {self.config.hpc_host} -W {remote_host}:{remote_port}"
+        
+        # 3. Construct local tunnel command
+        # Fix A: Add StrictHostKeyChecking=no to prevent fingerprint verification popup
+        # Fix B: Use 127.0.0.1 to prevent DNS resolution failure
+        # Fix C: Add ServerAliveInterval to prevent idle disconnection
+        # Fix D: Explicitly specify HPC username to prevent using local Mac username
+        cmd = [
+            "ssh", "-N", 
+            "-L", f"{local_port}:{remote_host}:{remote_port}",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ServerAliveInterval=60",
+            "-o", f"ProxyCommand=ssh -q {self.config.address} {shlex.quote(proxy_cmd)}",
+            f"{hpc_user}@127.0.0.1"  # Force use of HPC username for login
+        ]
+        
+        # 3. Start process and perform health check
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            time.sleep(2)  # Give it 2 seconds to establish connection
             if proc.poll() is not None:
-                _, err = proc.communicate()
-                logging.warning(f"⚠️  Tunnel died immediately: {err.decode() if err else 'Unknown error'}")
-                logging.warning(f"⚠️  Auto-forwarding disabled. You may need to manually tunnel if needed.")
-                # Return an empty context manager
-                @contextlib.contextmanager
-                def dummy_forward():
-                    yield
-                return dummy_forward()
+                # If process has died, print error information
+                _, stderr = proc.communicate()
+                logging.error(f"❌ Tunnel died immediately!")
+                logging.error(f"Reason: {stderr.decode() if stderr else 'Unknown'}")
+                logging.info(f"Debug Command: {' '.join(cmd)}")  # Print command for manual debugging
+                yield  # Even though it failed, let the program continue to prevent crash in Context Manager
             else:
                 logging.info("✅ Tunnel established.")
                 yield
         finally:
             logging.info("🛑 Closing tunnel...")
             proc.terminate()
-            proc.wait()
+            # Ensure child process is cleaned up
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 # 🔵 Strategy B: Direct Fabric Connection - Original mode with password/OTP
 class DirectFabricExecutor(SSHExecutor):
